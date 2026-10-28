@@ -3,23 +3,21 @@
  *
  * Провайдер "router-llama" ОБЪЯВЛЕН в opencode.jsonc (npm @ai-sdk/openai-compatible,
  * options.baseURL + apiKey). Плагин не создаёт и не правит провайдер: он добавляет
- * в реестр список моделей роутера (GET /models, включая незагруженные) и снижает
- * лимиты модели "local". Секция "local" в opencode.jsonc не меняется.
+ * в реестр список моделей роутера (GET /models, включая незагруженные). С чужими
+ * провайдерами (в т.ч. "local") плагин не взаимодействует.
  *
- * Конфиг (opencode.jsonc) читается файлом на старте: адрес роутера, ключ и адрес
- * "local" известны ДО первого provider.transform, и плагин не зависит от порядка
+ * Конфиг (opencode.jsonc) читается файлом на старте: адрес роутера и ключ известны
+ * ДО первого provider.transform, и плагин не зависит от порядка
  * реестра. Запасные источники: опции плагина, переменные ROUTER_LLAMA_API_KEY /
  * LLAMA_API_KEY, значения по умолчанию.
  *
  * Режим роутера llama.cpp (llmr.bat: --no-models-autoload --models-preset --models-max 1):
  *   GET  /models        все модели + статусы   POST /models/load|unload {"model":"<id>"}
- *   GET  /v1/models     только загруженные     GET /health  публичный
  * Загрузку/выгрузку делает пользователь в диалоге /router-llama (tui.ts); агенту
  * доступен только инструмент чтения списка (router_llama_list).
  *
- * Лимиты local: в реестре заявлен контекст 200000, сервер держит max_context 131072
- * (читается из /health), и автосжатие начиналось по отказу сервера. Плагин снижает
- * limit.context/limit.output (потолок 16000) через ctx.model.transform.
+ * Контекст модели берётся из фактов роутера: meta.n_ctx для загруженной, иначе из
+ * имени пресета (…_128k) — каждый бэкенд стартует с --ctx-size из ini-пресета.
  */
 
 import { Model, Plugin, Provider } from "@opencode/plugin"
@@ -53,12 +51,8 @@ type ModelInfo = {
 type Discovered = { id: string; name: string; state: string; context: number }
 
 const PROVIDER_ID = "router-llama"
-const TEMPLATE_PROVIDER_ID = "local"
 const DEFAULT_BASE_URL = "http://127.0.0.1:9931/v1"
-const DEFAULT_LOCAL_URL = "http://127.0.0.1:8080/v1"
 const DEFAULT_REFRESH_MS = 20_000
-const OUTPUT_CAP = 16_000
-const ROUTER_OUTPUT_CAP = 8_192
 const KEY_ENV_NAMES = ["ROUTER_LLAMA_API_KEY", "LLAMA_API_KEY"]
 const READY_STATES = new Set(["loaded", "sleeping"])
 
@@ -95,14 +89,13 @@ function stripComments(text: string): string {
 
 /**
  * Конфиг OpenCode как файл: ~/.config/opencode/opencode.jsonc (JSONC). Достаёт
- * опции провайдера "router-llama" и адрес "local". Читаем сами, чтобы не зависеть
+ * опции провайдера "router-llama". Читаем сами, чтобы не зависеть
  * от того, в какой момент реестра выполняется transform.
  */
 function readConfig(): {
   baseURL?: string
   apiKey?: string
   name?: string
-  localBaseURL?: string
   path?: string
 } {
   const candidates = [
@@ -120,14 +113,11 @@ function readConfig(): {
       const parsed = JSON.parse(stripComments(String(readFileSync(path, "utf8"))))
       const providers: any = parsed?.provider ?? {}
       const router: any = providers[PROVIDER_ID]
-      const local: any = providers[TEMPLATE_PROVIDER_ID]
       const routerOpts: any = router?.options ?? router?.settings ?? {}
-      const localOpts: any = local?.options ?? local?.settings ?? {}
       return {
         baseURL: str(routerOpts.baseURL),
         apiKey: str(routerOpts.apiKey),
         name: str(router?.name),
-        localBaseURL: str(localOpts.baseURL),
         path,
       }
     } catch {
@@ -182,13 +172,6 @@ function authHeaders(apiKey?: string): Record<string, string> {
   return { authorization: `Bearer ${apiKey}`, "x-api-key": apiKey }
 }
 
-/** max_context сервера "local" из публичного /health. 0 = прочитать не удалось. */
-async function maxContextOf(baseURL: string): Promise<number> {
-  const health = await request(`${rootOf(baseURL)}/health`, {})
-  const value = Number(health?.json?.max_context ?? 0)
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
-}
-
 /** GET /models роутера: все модели, включая незагруженные. */
 async function probeRouter(root: string, apiKey?: string): Promise<Discovered[]> {
   const list = await request(`${root}/models`, authHeaders(apiKey))
@@ -207,32 +190,29 @@ async function probeRouter(root: string, apiKey?: string): Promise<Discovered[]>
   return models
 }
 
-function toModelInfo(entry: Discovered, providerID: string, template: ModelInfo | undefined): ModelInfo {
-  const clone = structuredClone(
-    template ?? {
-      id: "",
-      modelID: "",
-      providerID,
-      name: "",
-      capabilities: { tools: true, input: ["text"], output: ["text"] },
-      variants: [],
-      time: { released: 0 },
-      cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
-      status: "active",
-      enabled: true,
-      limit: { context: 8192, output: 4096 },
-    },
-  ) as ModelInfo
-  clone.id = entry.id
-  clone.modelID = entry.id
-  clone.providerID = providerID
-  clone.name = entry.name
-  clone.enabled = true
-  clone.status = "active"
-  if (entry.context > 0) clone.limit = { ...clone.limit, context: entry.context }
-  const output = Number(clone.limit?.output ?? 0)
-  if (!(output > 0) || output > ROUTER_OUTPUT_CAP) clone.limit = { ...clone.limit, output: ROUTER_OUTPUT_CAP }
-  return clone
+/**
+ * Запись модели для реестра. Лимиты не снижаем искусственно: контекст берётся из
+ * фактов роутера (n_ctx / имя пресета), остальное — разумные значения по умолчанию.
+ */
+function toModelInfo(entry: Discovered, providerID: string): ModelInfo {
+  const model: ModelInfo = {
+    id: "",
+    modelID: "",
+    providerID,
+    name: "",
+    capabilities: { tools: true, input: ["text"], output: ["text"] },
+    variants: [],
+    time: { released: 0 },
+    cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+    status: "active",
+    enabled: true,
+    limit: { context: 8192, output: 4096 },
+  }
+  model.id = entry.id
+  model.modelID = entry.id
+  model.name = entry.name
+  if (entry.context > 0) model.limit = { ...model.limit, context: entry.context }
+  return model
 }
 
 export default Plugin.define({
@@ -248,35 +228,13 @@ export default Plugin.define({
         str(options.apiKey) ??
         config.apiKey ??
         KEY_ENV_NAMES.map(env).find((value) => value !== undefined),
-      localBaseURL: str(options.localBaseURL) ?? config.localBaseURL ?? DEFAULT_LOCAL_URL,
-      localMaxContext: 0,
       models: [] as Discovered[],
-      template: undefined as ModelInfo | undefined,
       signature: "",
     }
     log(
-      `setup: baseURL=${state.baseURL} key=${state.apiKey ? "есть" : "нет"} local=${state.localBaseURL}` +
+      `setup: baseURL=${state.baseURL} key=${state.apiKey ? "есть" : "нет"}` +
         (config.path ? ` config=${config.path}` : " config не найден"),
     )
-
-    const localProbe = async (): Promise<number> => {
-      const value = await maxContextOf(state.localBaseURL)
-      if (value > 0 && value !== state.localMaxContext) {
-        log(`local ${state.localBaseURL}: max_context ${state.localMaxContext || "?"} -> ${value}`)
-        state.localMaxContext = value
-      }
-      return value
-    }
-
-    // Шаблон модели и адрес "local" — из реестра, если уже есть; иначе из конфига файла.
-    const ensureTemplate = (editor: any) => {
-      const local: any = editor.get?.(TEMPLATE_PROVIDER_ID)
-      const templateModel: any = local?.models?.values?.().next?.().value
-      if (templateModel) state.template = structuredClone(templateModel) as ModelInfo
-      const discovered =
-        str(local?.provider?.settings?.baseURL) ?? str(local?.provider?.options?.baseURL)
-      if (discovered) state.localBaseURL = discovered
-    }
 
     const addProvider = (editor: any) => {
       const record: any = editor.get?.(PROVIDER_ID)
@@ -299,10 +257,7 @@ export default Plugin.define({
       info.id = PROVIDER_ID
       info.activation = "enabled"
       info.description = `llama.cpp router ${rootOf(state.baseURL)}`
-      const models = state.models.map((entry) => ({
-        ...toModelInfo(entry, PROVIDER_ID, state.template),
-        enabled: true,
-      }))
+      const models = state.models.map((entry) => toModelInfo(entry, PROVIDER_ID))
       // Провайдер уже в реестре (из opencode.jsonc), но моделей нет — подставляем список.
       if (record?.models && typeof editor.models?.set === "function") {
         editor.models.set(PROVIDER_ID, models)
@@ -315,36 +270,11 @@ export default Plugin.define({
 
     try {
       await ctx.provider.transform((editor: any) => {
-        ensureTemplate(editor)
         addProvider(editor)
       })
       log(`provider.transform зарегистрирован, моделей в реестр: ${state.models.length}`)
     } catch (error: any) {
       log(`provider.transform НЕ зарегистрирован: ${String(error?.message ?? error)}`)
-    }
-
-    // Потолки limit у local/loaded-gguf: только снижаем, opencode.jsonc не меняется.
-    try {
-      await localProbe()
-      await ctx.model.transform((editor: any) => {
-        const contextCap = state.localMaxContext
-        for (const model of editor.list?.(TEMPLATE_PROVIDER_ID) ?? []) {
-          const provider = typeof model?.providerID === "string" ? model.providerID : undefined
-          const id = typeof model?.id === "string" ? model.id : undefined
-          if (provider !== TEMPLATE_PROVIDER_ID || !id) continue
-          const output = Number(model?.limit?.output ?? 0)
-          const context = Number(model?.limit?.context ?? 0)
-          const nextOutput = output > OUTPUT_CAP ? OUTPUT_CAP : output
-          const nextContext = contextCap > 0 && context > contextCap ? contextCap : context
-          if (nextOutput === output && nextContext === context) continue
-          editor.update(provider, id, (target: any) => {
-            target.limit = { ...(target.limit ?? {}), output: nextOutput, context: nextContext }
-          })
-          log(`${provider}/${id}: limit.output ${output} -> ${nextOutput}, limit.context ${context} -> ${nextContext}`)
-        }
-      })
-    } catch (error: any) {
-      log(`model.transform НЕ зарегистрирован: ${String(error?.message ?? error)}`)
     }
 
     // Инструмент агенту — только чтение списка. Загрузку делает пользователь в /llama-router.
@@ -384,17 +314,10 @@ export default Plugin.define({
     }
     const first = setTimeout(() => void sync(), 1500)
     const timer = setInterval(() => void sync(), refreshMs)
-    // Сервер 8080 мог перезапуститься с другим ctx-size: порог автосжатия должен совпадать.
-    const localTimer = setInterval(async () => {
-      const previous = state.localMaxContext
-      const live = await localProbe()
-      if (live > 0 && live !== previous) await ctx.model.reload()
-    }, refreshMs)
 
     return () => {
       clearTimeout(first)
       clearInterval(timer)
-      clearInterval(localTimer)
     }
   },
 })
